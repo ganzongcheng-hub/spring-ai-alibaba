@@ -95,7 +95,7 @@ public class ReactAgent extends BaseAgent {
 	
 	private StateSerializer stateSerializer;
 
-    private static Boolean hasTools = false;
+    private final Boolean hasTools;
 
 	public ReactAgent(AgentLlmNode llmNode, AgentToolNode toolNode, CompileConfig compileConfig, Builder builder) {
 		super(builder.name, builder.description, builder.includeContents, builder.returnReasoningContents, builder.outputKey, builder.outputKeyStrategy);
@@ -115,6 +115,9 @@ public class ReactAgent extends BaseAgent {
 		// Set state serializer from builder, or use default
         // Default to Jackson serializer for better compatibility and features
         this.stateSerializer = Objects.requireNonNullElseGet(builder.stateSerializer, () -> new SpringAIJacksonStateSerializer(OverAllState::new));
+
+		// Set executor configuration from builder
+		this.executor = builder.executor;
 
 		// Set interceptors to nodes
 		if (this.modelInterceptors != null && !this.modelInterceptors.isEmpty()) {
@@ -430,7 +433,7 @@ public class ReactAgent extends BaseAgent {
 		}
 
 		// Add tool routing if tools exist
-		if (hasTools) {
+		if (agentInstance.hasTools) {
 			setupToolRouting(graph, loopExitNode, loopEntryNode, exitNode, agentInstance);
 		} else if (!loopExitNode.equals("model")) {
 			// No tools but have after_model - connect to exit
