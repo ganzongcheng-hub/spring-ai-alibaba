@@ -92,7 +92,7 @@ public class ReactAgent extends BaseAgent {
 	private List<ToolInterceptor> toolInterceptors;
 
 	private String instruction;
-	
+
 	private StateSerializer stateSerializer;
 
     private final Boolean hasTools;
@@ -111,7 +111,7 @@ public class ReactAgent extends BaseAgent {
 		this.inputType = builder.inputType;
 		this.outputSchema = builder.outputSchema;
 		this.outputType = builder.outputType;
-		
+
 		// Set state serializer from builder, or use default
         // Default to Jackson serializer for better compatibility and features
         this.stateSerializer = Objects.requireNonNullElseGet(builder.stateSerializer, () -> new SpringAIJacksonStateSerializer(OverAllState::new));
@@ -193,11 +193,11 @@ public class ReactAgent extends BaseAgent {
 	}
 
 	@Override
-	public Node asNode(boolean includeContents, boolean returnReasoningContents, String outputKeyToParent) {
+	public Node asNode(boolean includeContents, boolean returnReasoningContents) {
 		if (this.compiledGraph == null) {
 			this.compiledGraph = getAndCompileGraph();
 		}
-		return new AgentSubGraphNode(this.name, includeContents, returnReasoningContents, outputKeyToParent, this.compiledGraph, this.instruction);
+		return new AgentSubGraphNode(this.name, includeContents, returnReasoningContents, this.compiledGraph, this.instruction);
 	}
 
 	@Override
@@ -473,12 +473,12 @@ public class ReactAgent extends BaseAgent {
 			String modelDestination,
 			String endDestination) throws GraphStateException {
 		if (!hooks.isEmpty()) {
-			Hook last = hooks.get(hooks.size() - 1);
+			Hook first = hooks.get(0);
 			addHookEdge(graph,
-					defaultNext,
+					first.getName() + nameSuffix,
 					StateGraph.END,
 					modelDestination, endDestination,
-					last.canJumpTo());
+					first.canJumpTo());
 		}
 
 		for (int i = hooks.size() - 1; i > 0; i--) {
@@ -698,15 +698,7 @@ public class ReactAgent extends BaseAgent {
 		llmNode.setInstruction(instruction);
 	}
 
-	public KeyStrategy getOutputKeyStrategy() {
-		return outputKeyStrategy;
-	}
-
-	public void setOutputKeyStrategy(KeyStrategy outputKeyStrategy) {
-		this.outputKeyStrategy = outputKeyStrategy;
-	}
-
-	public static class SubGraphNodeAdapter implements NodeActionWithConfig {
+	public class SubGraphNodeAdapter implements NodeActionWithConfig {
 
 		private boolean includeContents;
 
@@ -714,18 +706,15 @@ public class ReactAgent extends BaseAgent {
 
 		private String instruction;
 
-		private String outputKeyToParent;
-
 		private CompiledGraph childGraph;
 
 		private CompileConfig parentCompileConfig;
 
-		public SubGraphNodeAdapter(boolean includeContents, boolean returnReasoningContents, String outputKeyToParent,
+		public SubGraphNodeAdapter(boolean includeContents, boolean returnReasoningContents,
 				CompiledGraph childGraph, String instruction, CompileConfig parentCompileConfig) {
 			this.includeContents = includeContents;
 			this.returnReasoningContents = returnReasoningContents;
 			this.instruction = instruction;
-			this.outputKeyToParent = outputKeyToParent;
 			this.childGraph = childGraph;
 			this.parentCompileConfig = parentCompileConfig;
 		}
@@ -759,7 +748,8 @@ public class ReactAgent extends BaseAgent {
 
 			Map<String, Object> result = new HashMap<>();
 
-			result.put(StringUtils.hasLength(this.outputKeyToParent) ? this.outputKeyToParent : "messages", getGraphResponseFlux(parentState, subGraphResult));
+			String outputKeyToParent = StringUtils.hasLength(ReactAgent.this.outputKey) ? ReactAgent.this.outputKey : "messages";
+			result.put(outputKeyToParent, getGraphResponseFlux(parentState, subGraphResult));
 			if (parentMessages != null) {
 				result.put("messages", parentMessages);
 			}
@@ -854,19 +844,24 @@ public class ReactAgent extends BaseAgent {
 	/**
 	 * Internal class that adapts a ReactAgent to be used as a SubGraph Node.
 	 */
-	private static class AgentSubGraphNode extends Node implements SubGraphNode {
+	private class AgentSubGraphNode extends Node implements SubGraphNode {
 
 		private final CompiledGraph subGraph;
 
-		public AgentSubGraphNode(String id, boolean includeContents, boolean returnReasoningContents, String outputKeyToParent, CompiledGraph subGraph, String instruction) {
+		public AgentSubGraphNode(String id, boolean includeContents, boolean returnReasoningContents, CompiledGraph subGraph, String instruction) {
 			super(Objects.requireNonNull(id, "id cannot be null"),
-					(config) -> node_async(new SubGraphNodeAdapter(includeContents, returnReasoningContents, outputKeyToParent, subGraph, instruction, config)));
+					(config) -> node_async(new SubGraphNodeAdapter(includeContents, returnReasoningContents, subGraph, instruction, config)));
 			this.subGraph = subGraph;
 		}
 
 		@Override
 		public StateGraph subGraph() {
 			return subGraph.stateGraph;
+		}
+
+		@Override
+		public Map<String, KeyStrategy> keyStrategies() {
+			return subGraph.getKeyStrategyMap();
 		}
 	}
 }
