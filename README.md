@@ -56,7 +56,7 @@ There's a ChatBot example provided by the community at [examples/chatbot](https:
 1. Download the code.
 
 	```shell
-	git clone https://github.com/alibaba/spring-ai-alibaba.git
+	git clone --depth=1 https://github.com/alibaba/spring-ai-alibaba.git
 	cd examples/chatbot
 	```
 
@@ -89,18 +89,19 @@ There's a ChatBot example provided by the community at [examples/chatbot](https:
 	  <dependency>
 	    <groupId>com.alibaba.cloud.ai</groupId>
 	    <artifactId>spring-ai-alibaba-agent-framework</artifactId>
-	    <version>1.1.0.0-RC1</version>
+	    <version>1.1.0.0-RC2</version>
 	  </dependency>
 	  <!-- Assume you are going to use DashScope Model. Refer to docs for how to choose model.-->
 	  <dependency>
 	    <groupId>com.alibaba.cloud.ai</groupId>
 	    <artifactId>spring-ai-alibaba-starter-dashscope</artifactId>
-	    <version>1.1.0.0-RC1</version>
+	    <version>1.1.0.0-RC2</version>
 	  </dependency>
 	</dependencies>
 	```
 
 2. Define Chatbot
+   
 	For more details of how to write a Chatbot, please check the [Quick Start](https://java2ai.com/docs/quick-start) on our official website.
 
 ## 📚 Documentation
