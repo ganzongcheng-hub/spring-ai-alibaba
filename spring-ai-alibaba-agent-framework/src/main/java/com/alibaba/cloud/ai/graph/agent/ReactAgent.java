@@ -63,11 +63,13 @@ import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.tool.ToolCallback;
+
 import org.springframework.util.StringUtils;
 import reactor.core.publisher.Flux;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -136,11 +138,15 @@ public class ReactAgent extends BaseAgent {
 		this.executor = builder.executor;
 
 		// Set interceptors to nodes
-		if (this.modelInterceptors != null && !this.modelInterceptors.isEmpty()) {
-			this.llmNode.setModelInterceptors(this.modelInterceptors);
+		// Collect interceptors from hooks and merge with current interceptors
+		List<ModelInterceptor> mergedModelInterceptors = collectAndMergeModelInterceptors();
+		List<ToolInterceptor> mergedToolInterceptors = collectAndMergeToolInterceptors();
+
+		if (mergedModelInterceptors != null && !mergedModelInterceptors.isEmpty()) {
+			this.llmNode.setModelInterceptors(mergedModelInterceptors);
 		}
-		if (this.toolInterceptors != null && !this.toolInterceptors.isEmpty()) {
-			this.toolNode.setToolInterceptors(this.toolInterceptors);
+		if (mergedToolInterceptors != null && !mergedToolInterceptors.isEmpty()) {
+			this.toolNode.setToolInterceptors(mergedToolInterceptors);
 		}
 
         // Set tools flag if tool interceptors are present.
@@ -179,6 +185,43 @@ public class ReactAgent extends BaseAgent {
 		return doMessageInvoke(messages, config);
 	}
 
+	/**
+	 * Calls the agent with the given inputs map and returns the assistant message.
+	 * <p>
+	 * When you need to pass additional parameters beyond {@code messages} and {@code input},
+	 * use this overload.
+	 * <p>
+	 * Reserved keys: {@code messages} and {@code input} are used as question/input for the
+	 * agent. Other keys can be arbitrary and are passed as graph state, e.g. for prompt
+	 * placeholders or any other state values.
+	 *
+	 * @param inputs the input map (reserved: messages, input; other keys as state)
+	 * @return the assistant message response
+	 * @throws GraphRunnerException if the graph execution fails
+	 */
+	public AssistantMessage call(Map<String, Object> inputs) throws GraphRunnerException {
+		return doMessageInvoke(inputs, null);
+	}
+
+	/**
+	 * Calls the agent with the given inputs map and runtime config, returns the assistant message.
+	 * <p>
+	 * When you need to pass additional parameters beyond {@code messages} and {@code input},
+	 * use this overload.
+	 * <p>
+	 * Reserved keys: {@code messages} and {@code input} are used as question/input for the
+	 * agent. Other keys can be arbitrary and are passed as graph state, e.g. for prompt
+	 * placeholders or any other state values.
+	 *
+	 * @param inputs the input map (reserved: messages, input; other keys as state)
+	 * @param config runtime configuration controlling execution behavior
+	 * @return the assistant message response
+	 * @throws GraphRunnerException if the graph execution fails
+	 */
+	public AssistantMessage call(Map<String, Object> inputs, RunnableConfig config) throws GraphRunnerException {
+		return doMessageInvoke(inputs, config);
+	}
+
 	public void interrupt(RunnableConfig config) {
 		updateAgentState(List.of(), config);
 	}
@@ -214,24 +257,30 @@ public class ReactAgent extends BaseAgent {
 	}
 
 	private AssistantMessage doMessageInvoke(Object message, RunnableConfig config) throws GraphRunnerException {
-		Map<String, Object> inputs= buildMessageInput(message);
-		Optional<OverAllState> state = doInvoke(inputs, config);
+		Map<String, Object> inputs = buildMessageInput(message);
+		return extractAssistantMessage(doInvoke(inputs, config));
+	}
 
+	private AssistantMessage doMessageInvoke(Map<String, Object> inputs, RunnableConfig config) throws GraphRunnerException {
+		return extractAssistantMessage(doInvoke(inputs, config));
+	}
+
+	private AssistantMessage extractAssistantMessage(Optional<OverAllState> state) {
 		if (StringUtils.hasLength(outputKey)) {
 			return state.flatMap(s -> s.value(outputKey))
 					.map(msg -> (AssistantMessage) msg)
-					.orElseThrow(() -> new IllegalStateException("Output key " + outputKey + " not found in agent state") );
+					.orElseThrow(() -> new IllegalStateException("Output key " + outputKey + " not found in agent state"));
 		}
 
-        // Add a validation instance when performing message conversion to
-        // avoid potential type conversion exceptions.
-        return state.flatMap(s -> s.value("messages"))
-                .stream()
-                .flatMap(messageList -> ((List<?>) messageList).stream()
-                        .filter(msg -> msg instanceof AssistantMessage)
-                        .map(msg -> (AssistantMessage) msg))
-                .reduce((first, second) -> second)
-                .orElseThrow(() -> new AgentException("No AssistantMessage found in 'messages' state"));
+		// Add a validation instance when performing message conversion to
+		// avoid potential type conversion exceptions.
+		return state.flatMap(s -> s.value("messages"))
+				.stream()
+				.flatMap(messageList -> ((List<?>) messageList).stream()
+						.filter(msg -> msg instanceof AssistantMessage)
+						.map(msg -> (AssistantMessage) msg))
+				.reduce((first, second) -> second)
+				.orElseThrow(() -> new AgentException("No AssistantMessage found in 'messages' state"));
 	}
 
 	public StateGraph getStateGraph() {
@@ -440,9 +489,7 @@ public class ReactAgent extends BaseAgent {
 		}
 		
 		// Sort prioritized hooks by their order
-		prioritizedHooks.sort((h1, h2) -> Integer.compare(
-				((Prioritized) h1).getOrder(),
-				((Prioritized) h2).getOrder()));
+		prioritizedHooks.sort(Comparator.comparingInt(h -> ((Prioritized) h).getOrder()));
 		
 		// Combine: prioritized hooks first (sorted), then non-prioritized hooks (original order)
 		List<Hook> result = new ArrayList<>(prioritizedHooks);
@@ -701,6 +748,28 @@ public class ReactAgent extends BaseAgent {
 
 	private EdgeAction makeModelToTools(String modelDestination, String endDestination) {
 		return state -> {
+			// Priority 1: Check for jump_to instruction from hooks
+			// This allows afterModel hooks to control workflow execution
+			Object jumpToValue = state.value("jump_to").orElse(null);
+			if (jumpToValue != null) {
+				JumpTo jumpTo = null;
+				if (jumpToValue instanceof JumpTo) {
+					jumpTo = (JumpTo) jumpToValue;
+				} else if (jumpToValue instanceof String) {
+					jumpTo = JumpTo.fromStringOrNull((String) jumpToValue);
+				}
+				
+				// If a valid jump_to instruction exists, execute it immediately
+				if (jumpTo != null) {
+					return switch (jumpTo) {
+						case model -> modelDestination;
+						case end -> endDestination;
+						case tool -> AGENT_TOOL_NAME;
+					};
+				}
+			}
+			
+			// Priority 2: Check message content for tool calls
 			List<Message> messages = (List<Message>) state.value("messages").orElse(List.of());
 			if (messages.isEmpty()) {
 				logger.warn("No messages found in state when routing from model to tools");
@@ -787,6 +856,90 @@ public class ReactAgent extends BaseAgent {
 		return toolResponseMessage;
 	}
 
+	/**
+	 * Collects model interceptors from hooks (ModelHook and AgentHook) and merges them
+	 * with the current model interceptors.
+	 * <p>
+	 * If interceptors with the same name exist, the ones from ReactAgent configuration
+	 * take priority over those from hooks.
+	 *
+	 * @return merged list of model interceptors, or null if no interceptors exist
+	 */
+	private List<ModelInterceptor> collectAndMergeModelInterceptors() {
+		List<ModelInterceptor> result = new ArrayList<>();
+		Set<String> addedNames = new HashSet<>();
+
+		// Add current model interceptors if they exist (higher priority)
+		if (this.modelInterceptors != null && !this.modelInterceptors.isEmpty()) {
+			for (ModelInterceptor interceptor : this.modelInterceptors) {
+				result.add(interceptor);
+				addedNames.add(interceptor.getName());
+			}
+		}
+
+		// Collect interceptors from hooks (skip if name already exists)
+		if (this.hooks != null && !this.hooks.isEmpty()) {
+			for (Hook hook : this.hooks) {
+				List<ModelInterceptor> hookInterceptors = hook.getModelInterceptors();
+				if (hookInterceptors != null && !hookInterceptors.isEmpty()) {
+					for (ModelInterceptor interceptor : hookInterceptors) {
+						String name = interceptor.getName();
+						if (!addedNames.contains(name)) {
+							result.add(interceptor);
+							addedNames.add(name);
+						} else {
+							logger.info("Skipping model interceptor '{}' from hook '{}' because an interceptor with the same name already exists in ReactAgent configuration", name, hook.getName());
+						}
+					}
+				}
+			}
+		}
+
+		return result.isEmpty() ? null : result;
+	}
+
+	/**
+	 * Collects tool interceptors from hooks (ModelHook and AgentHook) and merges them
+	 * with the current tool interceptors.
+	 * <p>
+	 * If interceptors with the same name exist, the ones from ReactAgent configuration
+	 * take priority over those from hooks.
+	 *
+	 * @return merged list of tool interceptors, or null if no interceptors exist
+	 */
+	private List<ToolInterceptor> collectAndMergeToolInterceptors() {
+		List<ToolInterceptor> result = new ArrayList<>();
+		Set<String> addedNames = new HashSet<>();
+
+		// Add current tool interceptors if they exist (higher priority)
+		if (this.toolInterceptors != null && !this.toolInterceptors.isEmpty()) {
+			for (ToolInterceptor interceptor : this.toolInterceptors) {
+				result.add(interceptor);
+				addedNames.add(interceptor.getName());
+			}
+		}
+
+		// Collect interceptors from hooks (skip if name already exists)
+		if (this.hooks != null && !this.hooks.isEmpty()) {
+			for (Hook hook : this.hooks) {
+				List<ToolInterceptor> hookInterceptors = hook.getToolInterceptors();
+				if (hookInterceptors != null && !hookInterceptors.isEmpty()) {
+					for (ToolInterceptor interceptor : hookInterceptors) {
+						String name = interceptor.getName();
+						if (!addedNames.contains(name)) {
+							result.add(interceptor);
+							addedNames.add(name);
+						} else {
+							logger.info("Skipping tool interceptor '{}' from hook '{}' because an interceptor with the same name already exists in ReactAgent configuration", name, hook.getName());
+						}
+					}
+				}
+			}
+		}
+
+		return result.isEmpty() ? null : result;
+	}
+
 	public String instruction() {
 		return instruction;
 	}
@@ -794,6 +947,10 @@ public class ReactAgent extends BaseAgent {
 	public void setInstruction(String instruction) {
 		this.instruction = instruction;
 		llmNode.setInstruction(instruction);
+	}
+
+	public void setSystemPrompt(String systemPrompt) {
+		llmNode.setSystemPrompt(systemPrompt);
 	}
 
 	public Map<String, Object> getThreadState(String threadId) {
@@ -950,10 +1107,10 @@ public class ReactAgent extends BaseAgent {
 		private RunnableConfig getSubGraphRunnableConfig(RunnableConfig config) {
 			RunnableConfig subGraphRunnableConfig = RunnableConfig.builder(config)
 					.checkPointId(null)
-					.clearContext()
 					.nextNode(null)
 					.addMetadata("_AGENT_", subGraphId(nodeId)) // subGraphId is the same as the name of the agent that created it
 					.build();
+			subGraphRunnableConfig.clearContext();
 			var parentSaver = parentCompileConfig.checkpointSaver();
 			var subGraphSaver = childGraph.compileConfig.checkpointSaver();
 
@@ -970,14 +1127,13 @@ public class ReactAgent extends BaseAgent {
 									.orElseGet(() -> subGraphId(nodeId)))
 							.nextNode(null)
 							.checkPointId(null)
-							.clearContext()
 							.addMetadata("_AGENT_", subGraphId(nodeId)) // subGraphId is the same as the name of the agent that created it
 							.build();
+					subGraphRunnableConfig.clearContext();
 				}
 			}
 			return subGraphRunnableConfig;
 		}
-
 	}
 
 	/**

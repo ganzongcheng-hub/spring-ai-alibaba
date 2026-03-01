@@ -16,17 +16,23 @@ package com.alibaba.cloud.ai.graph.agent.flow.strategy;
  */
 
 import com.alibaba.cloud.ai.graph.agent.Agent;
+import com.alibaba.cloud.ai.graph.agent.ReactAgent;
 import com.alibaba.cloud.ai.graph.agent.flow.agent.FlowAgent;
-import com.alibaba.cloud.ai.graph.agent.flow.agent.SupervisorAgent;
 import com.alibaba.cloud.ai.graph.agent.flow.builder.FlowGraphBuilder;
 import com.alibaba.cloud.ai.graph.agent.flow.enums.FlowAgentEnum;
-import com.alibaba.cloud.ai.graph.agent.flow.node.SupervisorEdgeAction;
+import com.alibaba.cloud.ai.graph.agent.flow.node.MainAgentNodeAction;
+import com.alibaba.cloud.ai.graph.agent.flow.node.MainAgentToSupervisorEdgeAction;
+import com.alibaba.cloud.ai.graph.agent.flow.node.SupervisorNodeFromState;
 import com.alibaba.cloud.ai.graph.exception.GraphStateException;
 
 import java.util.HashMap;
 import java.util.Map;
 
+import com.alibaba.cloud.ai.graph.action.AsyncMultiCommandAction;
+import com.alibaba.cloud.ai.graph.action.AsyncNodeActionWithConfig;
+
 import static com.alibaba.cloud.ai.graph.StateGraph.END;
+import static com.alibaba.cloud.ai.graph.action.AsyncNodeAction.node_async;
 
 /**
  * Strategy for building supervisor-based routing graphs. In a supervisor graph, an LLM
@@ -41,32 +47,55 @@ public class SupervisorGraphBuildingStrategy extends AbstractFlowGraphBuildingSt
 			throws GraphStateException {
 		validateSupervisorConfig(config);
 
-		SupervisorAgent supervisorRootAgent = (SupervisorAgent) this.rootAgent;
-
-		// Add and chain beforeModel hooks
-		if (!this.beforeModelHooks.isEmpty()) {
-			addBeforeModelHookNodesToGraph(this.graph, this.rootAgent.name(), this.beforeModelHooks);
+		Agent rootAgent = getRootAgent();
+		Agent mainAgent = config.getMainAgent();
+		// First node is mainAgent via MainAgentNodeAction (proxy), no asNode()
+		if (mainAgent instanceof ReactAgent reactAgent) {
+			this.graph.addNode(rootAgent.name(), AsyncNodeActionWithConfig.node_async(new MainAgentNodeAction(reactAgent, config.getSubAgents())));
 		}
-
-		// Add afterModel hook nodes and get the routing target
-		String afterModelNodeName = addAfterModelHookNodesToGraph(this.graph, this.rootAgent.name(), this.afterModelHooks);
+		else {
+			throw new IllegalArgumentException("Supervisor mainAgent must be a ReactAgent, got: " + (mainAgent != null ? mainAgent.getClass().getName() : "null"));
+		}
 
 		// Process sub-agents for routing
 		Map<String, String> edgeRoutingMap = new HashMap<>();
 		for (Agent subAgent : config.getSubAgents()) {
 			FlowGraphBuildingStrategy.addSubAgentNode(subAgent, this.graph);
 			edgeRoutingMap.put(subAgent.name(), subAgent.name());
-			// Sub-agent returns to the entry node (could be beforeAgent/beforeModel hook)
 			this.graph.addEdge(subAgent.name(), this.entryNode);
 		}
 
-		// Add END as a possible routing destination
-		edgeRoutingMap.put(END, END);
+		buildCoreGraphWithMainAgent(config, rootAgent, edgeRoutingMap);
+	}
 
-		// Connect supervisor to routing logic
-		String routingSourceNode = this.afterModelHooks.isEmpty() ? this.rootAgent.name() : afterModelNodeName;
-		this.graph.addConditionalEdges(routingSourceNode,
-				new SupervisorEdgeAction(config.getChatModel(), supervisorRootAgent, config.getSubAgents()), edgeRoutingMap);
+	/**
+	 * Builds the supervisor graph: first node is mainAgent (at rootAgent.name()); conditional
+	 * edge from mainAgent to SupervisorNode or END; SupervisorNode returns MultiCommand from
+	 * mainAgent output and routes to subAgents in parallel.
+	 */
+	private void buildCoreGraphWithMainAgent(FlowGraphBuilder.FlowGraphConfig config,
+			Agent rootAgent, Map<String, String> edgeRoutingMap) throws GraphStateException {
+		String mainAgentNodeName = rootAgent.name();
+		String supervisorNodeName = rootAgent.name() + "_supervisor";
+		String routingKey = config.getCustomProperty("supervisor.routingKey") != null
+				? String.valueOf(config.getCustomProperty("supervisor.routingKey"))
+				: SupervisorNodeFromState.SUPERVISOR_NEXT_KEY;
+
+		// SupervisorNode (add before edges that reference it)
+		this.graph.addNode(supervisorNodeName, node_async(state -> Map.of()));
+
+		// 2.1 Conditional edge from mainAgentNode to SupervisorNode or END
+		MainAgentToSupervisorEdgeAction mainAgentToSupervisor = new MainAgentToSupervisorEdgeAction(routingKey, supervisorNodeName);
+		Map<String, String> mainAgentEdgeMap = new HashMap<>();
+		mainAgentEdgeMap.put(END, this.exitNode);
+		mainAgentEdgeMap.put(supervisorNodeName, supervisorNodeName);
+		this.graph.addConditionalEdges(mainAgentNodeName, mainAgentToSupervisor, mainAgentEdgeMap);
+
+		// 2.2 Conditional edges from SupervisorNode to subAgents (MultiCommand from mainAgent output)
+		SupervisorNodeFromState supervisorNodeFromState = new SupervisorNodeFromState(routingKey, config.getSubAgents(), this.entryNode);
+		this.graph.addParallelConditionalEdges(supervisorNodeName,
+				AsyncMultiCommandAction.node_async(supervisorNodeFromState),
+				edgeRoutingMap);
 	}
 
 	@Override
@@ -90,8 +119,8 @@ public class SupervisorGraphBuildingStrategy extends AbstractFlowGraphBuildingSt
 			throw new IllegalArgumentException("Supervisor flow requires at least one sub-agent");
 		}
 
-		if (config.getChatModel() == null) {
-			throw new IllegalArgumentException("Supervisor flow requires a ChatModel for decision making");
+		if (config.getMainAgent() == null) {
+			throw new IllegalArgumentException("Supervisor flow requires mainAgent (ReactAgent)");
 		}
 
 		// Ensure root agent is a FlowAgent for input key access
